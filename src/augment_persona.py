@@ -24,6 +24,23 @@ from typing import Dict, List, Optional, Tuple
 import aiofiles
 import openai
 
+try:
+    from .utils import (
+        DEFAULT_FACET_SECTIONS,
+        build_answer_format_prompt,
+        extract_question_numbers,
+        parse_facet_responses,
+        parse_questionnaire_sections,
+    )
+except ImportError:
+    from utils import (
+        DEFAULT_FACET_SECTIONS,
+        build_answer_format_prompt,
+        extract_question_numbers,
+        parse_facet_responses,
+        parse_questionnaire_sections,
+    )
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -34,16 +51,7 @@ logger = logging.getLogger(__name__)
 class PersonaAugmenter:
     """Augments personas with SCOPE questionnaire responses using an LLM."""
 
-    FACET_SECTIONS = {
-        "demographics": "DEMOGRAPHIC INFORMATION",
-        "sociodemographic": "SOCIODEMOGRAPHIC BEHAVIOR",
-        "values": "PERSONAL VALUES & MOTIVATIONS",
-        "personality": "PERSONALITY TRAITS (Big Five)",
-        "behavioral": "BEHAVIORAL PATTERNS & PREFERENCES",
-        "identity": "PERSONAL IDENTITY & LIFE NARRATIVES",
-        "professional": "PROFESSIONAL IDENTITY & CAREER",
-        "creativity": "CREATIVITY & INNOVATION"
-    }
+    FACET_SECTIONS = DEFAULT_FACET_SECTIONS
 
     def __init__(
         self,
@@ -96,29 +104,7 @@ class PersonaAugmenter:
         with open(self.questionnaire_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        facet_content = {}
-
-        # Section headers in order (for boundary detection)
-        section_headers = list(self.FACET_SECTIONS.values())
-
-        for i, (facet_key, section_name) in enumerate(self.FACET_SECTIONS.items()):
-            # Build pattern to match section and extract content until next section
-            if i < len(section_headers) - 1:
-                next_sections = section_headers[i + 1:]
-                boundary = rf"(?=## .*?(?:{'|'.join(re.escape(s) for s in next_sections)}))"
-            else:
-                boundary = r"(?=## .*QUESTIONNAIRE SUMMARY|\Z)"
-
-            pattern = rf"## .*?{re.escape(section_name)}.*?\n(.*?){boundary}"
-            match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
-
-            if match:
-                facet_content[facet_key] = match.group(1).strip()
-                logger.debug(f"Parsed facet: {facet_key}")
-            else:
-                logger.warning(f"Could not find section: {section_name}")
-                facet_content[facet_key] = ""
-
+        facet_content = parse_questionnaire_sections(content, self.FACET_SECTIONS)
         logger.info(f"Parsed {len([f for f in facet_content.values() if f])} facet sections")
         return facet_content
 
@@ -139,6 +125,8 @@ class PersonaAugmenter:
             "questionnaires as that person would. You provide complete, thoughtful responses."
         )
 
+        answer_format = build_answer_format_prompt(extract_question_numbers(facet_questions))
+
         user_prompt = f"""You are embodying the following persona. Answer the questionnaire questions exactly as this person would, based on the persona information provided.
 
 {persona_content}
@@ -149,11 +137,7 @@ FACET: {facet_name}
 
 {facet_questions}
 
-Please provide your answers in the following format:
-Q1: [Your answer]
-Q2: [Your answer]
-Q3: [Your answer]
-...and so on.
+{answer_format}
 
 IMPORTANT INSTRUCTIONS:
 1. Answer EVERY question in the section
@@ -230,24 +214,22 @@ CRITICAL: You MUST choose from the exact options provided. Do not paraphrase or 
                 logger.error(f"Non-retryable API error: {e}")
                 raise
 
-    def _parse_responses(self, llm_output: str) -> Dict[str, str]:
+    def _parse_responses(
+        self,
+        llm_output: str,
+        expected_questions: Optional[List[int]] = None
+    ) -> Dict[str, str]:
         """
         Parse LLM output into question-answer pairs.
 
         Args:
             llm_output: Raw LLM response
+            expected_questions: Expected ordered question numbers for this facet
 
         Returns:
             Dictionary mapping question numbers to answers
         """
-        responses = {}
-        pattern = r'Q(\d+):\s*(.+?)(?=Q\d+:|$)'
-        matches = re.findall(pattern, llm_output, re.DOTALL)
-
-        for q_num, answer in matches:
-            responses[f"Q{q_num}"] = answer.strip()
-
-        return responses
+        return parse_facet_responses(llm_output, expected_questions=expected_questions)
 
     async def augment_persona(
         self,
@@ -285,9 +267,10 @@ CRITICAL: You MUST choose from the exact options provided. Do not paraphrase or 
                 persona_content, facet_name, questions
             )
 
+            expected_questions = extract_question_numbers(questions)
             try:
                 response = await self._call_llm(system_prompt, user_prompt)
-                parsed = self._parse_responses(response)
+                parsed = self._parse_responses(response, expected_questions=expected_questions)
                 facet_responses[facet_key] = parsed
                 logger.debug(f"Generated {len(parsed)} responses for {facet_key}")
             except Exception as e:
