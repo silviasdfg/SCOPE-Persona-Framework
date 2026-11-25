@@ -19,7 +19,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import aiofiles
 import openai
@@ -59,7 +59,8 @@ class PersonaAugmenter:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         temperature: float = 0.3,
-        max_tokens: int = 4000
+        max_tokens: int = 4000,
+        questionnaire_path: Optional[Union[str, Path]] = None
     ):
         """
         Initialize the persona augmenter.
@@ -70,6 +71,8 @@ class PersonaAugmenter:
             base_url: API base URL (defaults to OPENAI_BASE_URL or LLM_BASE_URL env var)
             temperature: LLM temperature for response generation
             max_tokens: Maximum tokens per response
+            questionnaire_path: Optional path to questionnaire markdown file
+                (defaults to data/questionnaire.md)
         """
         self.model = model
         self.temperature = temperature
@@ -93,13 +96,18 @@ class PersonaAugmenter:
         self.client = openai.AsyncOpenAI(**client_kwargs)
 
         # Load questionnaire
-        self.questionnaire_path = Path(__file__).parent.parent / "data" / "questionnaire.md"
+        if questionnaire_path is not None:
+            if not str(questionnaire_path).strip():
+                raise ValueError("Questionnaire path cannot be empty.")
+            self.questionnaire_path = Path(questionnaire_path)
+        else:
+            self.questionnaire_path = Path(__file__).parent.parent / "data" / "questionnaire.md"
         self.facet_questions = self._parse_questionnaire()
 
     def _parse_questionnaire(self) -> Dict[str, str]:
-        """Parse questionnaire.md and extract content for each facet section."""
-        if not self.questionnaire_path.exists():
-            raise FileNotFoundError(f"Questionnaire not found: {self.questionnaire_path}")
+        """Parse questionnaire markdown file and extract content for each facet section."""
+        if not self.questionnaire_path.is_file():
+            raise FileNotFoundError(f"Questionnaire file not found: {self.questionnaire_path}")
 
         with open(self.questionnaire_path, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -412,6 +420,12 @@ Paper: https://arxiv.org/abs/2601.07110
         help='Maximum number of personas to process'
     )
     parser.add_argument(
+        '--questionaire', '--questionnaire', '-q',
+        dest='questionnaire',
+        default=None,
+        help='Path to questionnaire markdown file (default: data/questionnaire.md)'
+    )
+    parser.add_argument(
         '--api-key',
         default=None,
         help='API key (default: from OPENAI_API_KEY or LLM_API_KEY env var)'
@@ -429,6 +443,13 @@ Paper: https://arxiv.org/abs/2601.07110
         logger.error(f"Input file not found: {args.input}")
         return
 
+    # Validate custom questionnaire file early if provided
+    if args.questionnaire is not None and (
+        not args.questionnaire.strip() or not Path(args.questionnaire).is_file()
+    ):
+        logger.error(f"Questionnaire file not found: {args.questionnaire}")
+        return
+
     # Parse facets
     facets = parse_facets(args.facets)
 
@@ -438,9 +459,10 @@ Paper: https://arxiv.org/abs/2601.07110
             model=args.model,
             api_key=args.api_key,
             base_url=args.base_url,
-            temperature=args.temperature
+            temperature=args.temperature,
+            questionnaire_path=args.questionnaire
         )
-    except ValueError as e:
+    except (ValueError, FileNotFoundError) as e:
         logger.error(str(e))
         return
 
@@ -448,6 +470,7 @@ Paper: https://arxiv.org/abs/2601.07110
     logger.info(f"Starting persona augmentation")
     logger.info(f"  Input: {args.input}")
     logger.info(f"  Output: {args.output}")
+    logger.info(f"  Questionnaire: {augmenter.questionnaire_path}")
     logger.info(f"  Model: {args.model}")
     logger.info(f"  Facets: {facets or 'all'}")
     logger.info(f"  Temperature: {args.temperature}")
