@@ -48,6 +48,69 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _resolve_llm_backend(
+    model: str,
+    api_key_override: Optional[str] = None,
+    base_url_override: Optional[str] = None,
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Determine which LLM backend to use for a given model name.
+
+    Decision logic
+    --------------
+    1. Read OPENAI_MODELS from the environment.  This should be a JSON array
+       string, e.g. ``'["poligpt"]'``.  Shell-style values such as
+       ``["poligpt"]`` (without quotes around the array elements) are also
+       handled via a fallback CSV parser.
+    2. If `model` is in that list -> use the **openai** backend with
+       OPENAI_API_KEY / OPENAI_BASE_URL.
+    3. Otherwise -> use the **litellm** backend with LLM_API_KEY / LLM_BASE_URL.
+       Ollama does not require a real API key; we default to the string
+       ``"ollama"`` so that openai.AsyncOpenAI (used internally by litellm)
+       does not reject the call for a missing key.
+
+    CLI overrides (`--api-key`, `--base-url`) always take precedence over
+    environment variables.
+
+    Args:
+        model:             Model identifier (e.g. ``"poligpt"`` or ``"llama3"``).
+        api_key_override:  Explicit API key from ``--api-key`` CLI flag.
+        base_url_override: Explicit base URL from ``--base-url`` CLI flag.
+
+    Returns:
+        A 3-tuple ``(backend, api_key, base_url)`` where *backend* is either
+        ``"openai"`` or ``"litellm"``.
+
+    Edge cases:
+        - OPENAI_MODELS not set -> treated as ``[]`` (no TypeError on ``in``).
+        - OPENAI_MODELS is not valid JSON -> parsed as comma-separated values so
+          shell-style ``["poligpt"]`` still works.
+        - LLM_API_KEY not set -> defaults to ``"ollama"`` for litellm path.
+        - api_key_override / base_url_override always win.
+    """
+    import json
+
+    openai_models_raw = os.environ.get("OPENAI_MODELS", "[]")
+    try:
+        openai_models: list = json.loads(openai_models_raw)
+    except (json.JSONDecodeError, ValueError):
+        # Fallback: strip brackets/quotes and split on comma
+        openai_models = [
+            m.strip().strip('"').strip("'")
+            for m in openai_models_raw.strip("[] ").split(",")
+            if m.strip().strip('"').strip("'")
+        ]
+
+    if model in openai_models:
+        api_key = api_key_override or os.environ.get("OPENAI_API_KEY")
+        base_url = base_url_override or os.environ.get("OPENAI_BASE_URL")
+        return "openai", api_key, base_url
+    else:
+        api_key = api_key_override or os.environ.get("LLM_API_KEY") or "ollama"
+        base_url = base_url_override or os.environ.get("LLM_BASE_URL")
+        return "litellm", api_key, base_url
+
+
 class PersonaAugmenter:
     """Augments personas with SCOPE questionnaire responses using an LLM."""
 
@@ -78,22 +141,42 @@ class PersonaAugmenter:
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-        # Resolve API credentials from environment if not provided
-        resolved_api_key = api_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
-        resolved_base_url = base_url or os.environ.get("OPENAI_BASE_URL") or os.environ.get("LLM_BASE_URL")
+        # -- Backend routing ---------------------------------------------------
+        # Reads OPENAI_MODELS from the environment (a JSON array string such as
+        # '["poligpt"]').  Models listed there use the OpenAI library with
+        # OPENAI_API_KEY / OPENAI_BASE_URL.  All other models are assumed to be
+        # served by an Ollama-compatible endpoint and use LiteLLM with
+        # LLM_BASE_URL.  LLM_API_KEY is optional; Ollama accepts any non-empty
+        # key so we default to the string "ollama" when none is set.
+        #
+        # Edge cases handled:
+        #   - OPENAI_MODELS not set -> defaults to [] (no crash on 'in' check)
+        #   - OPENAI_MODELS is not valid JSON (e.g. shell-style ["x"]) -> falls
+        #     back to splitting on comma so the value still works
+        #   - api_key / base_url CLI overrides always take precedence over env vars
+        self.backend, resolved_api_key, resolved_base_url = _resolve_llm_backend(
+            model, api_key_override=api_key, base_url_override=base_url
+        )
+        self.api_key = resolved_api_key
 
         if not resolved_api_key:
             raise ValueError(
                 "API key required. Set OPENAI_API_KEY or LLM_API_KEY environment variable, "
-                "or pass api_key parameter."
+                "or pass --api-key / api_key parameter."
             )
 
-        # Initialize OpenAI client
-        client_kwargs = {"api_key": resolved_api_key}
-        if resolved_base_url:
-            client_kwargs["base_url"] = resolved_base_url
+        # Only create an AsyncOpenAI client for the openai backend.
+        # LiteLLM's acompletion() receives credentials as call-time kwargs, so
+        # no persistent client object is needed.
+        if self.backend == "openai":
+            client_kwargs: dict = {"api_key": resolved_api_key}
+            if resolved_base_url:
+                client_kwargs["base_url"] = resolved_base_url
+            self.client = openai.AsyncOpenAI(**client_kwargs)
+        else:
+            self.client = None  # unused for litellm path
 
-        self.client = openai.AsyncOpenAI(**client_kwargs)
+        self.base_url = resolved_base_url
 
         # Load questionnaire
         if questionnaire_path is not None:
@@ -187,6 +270,15 @@ CRITICAL: You MUST choose from the exact options provided. Do not paraphrase or 
         """
         Make async LLM API call with retry logic.
 
+        Dispatches to the correct backend based on self.backend:
+          - "openai"  -> openai.AsyncOpenAI (self.client); for poligpt and any
+                        model listed in OPENAI_MODELS.
+          - "litellm" -> litellm.acompletion (lazy import); for Ollama-served
+                        models accessed via LLM_BASE_URL.
+
+        LiteLLM uses `api_base` (not `base_url`) and receives credentials
+        directly as call-time kwargs -- no persistent client object is needed.
+
         Args:
             system_prompt: System message
             user_prompt: User message
@@ -194,18 +286,43 @@ CRITICAL: You MUST choose from the exact options provided. Do not paraphrase or 
 
         Returns:
             LLM response content
+
+        Edge cases:
+          - On rate-limit / timeout / connection errors the call is retried up
+            to max_retries times with exponential back-off.
+          - LiteLLM wraps provider errors in its own exception hierarchy; we
+            catch them via their base class (Exception) so the retry logic
+            works uniformly across both backends.
         """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ]
+
         for attempt in range(max_retries + 1):
             try:
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens
-                )
+                if self.backend == "openai":
+                    # Uses the pre-initialised AsyncOpenAI client.
+                    response = await self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                    )
+                else:
+                    # LiteLLM -- imported lazily so the script doesn't crash at
+                    # module load when litellm is not installed and only OpenAI
+                    # models are used.
+                    from litellm import acompletion  # noqa: PLC0415
+                    response = await acompletion(
+                        model=self.model,
+                        messages=messages,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        api_base=self.base_url,  # litellm uses api_base, not base_url
+                        api_key=self.api_key,
+                    )
+
                 return response.choices[0].message.content
 
             except (openai.RateLimitError, openai.APITimeoutError,
@@ -219,8 +336,19 @@ CRITICAL: You MUST choose from the exact options provided. Do not paraphrase or 
                 await asyncio.sleep(backoff_time)
 
             except Exception as e:
-                logger.error(f"Non-retryable API error: {e}")
-                raise
+                # Catches litellm exceptions (RateLimitError, APIConnectionError,
+                # etc.) as well as any other unexpected errors.  Retryable
+                # LiteLLM errors contain keywords like "rate limit" or "timeout"
+                # in their message; everything else is re-raised immediately.
+                err_msg = str(e).lower()
+                is_transient = any(k in err_msg for k in ("rate limit", "timeout", "connection", "overloaded"))
+                if is_transient and attempt < max_retries:
+                    backoff_time = 2 ** attempt
+                    logger.warning(f"Attempt {attempt + 1} failed (transient): {e}. Retrying in {backoff_time}s...")
+                    await asyncio.sleep(backoff_time)
+                else:
+                    logger.error(f"Non-retryable API error: {e}")
+                    raise
 
     def _parse_responses(
         self,
@@ -394,7 +522,12 @@ Paper: https://arxiv.org/abs/2601.07110
     parser.add_argument(
         '--model', '-m',
         default='gpt-4o',
-        help='LLM model to use (default: gpt-4o)'
+        help=(
+            'LLM model to use (default: gpt-4o). '
+            'Models listed in the OPENAI_MODELS env var use the OpenAI backend '
+            '(OPENAI_API_KEY / OPENAI_BASE_URL); all other models use the '
+            'LiteLLM backend via LLM_BASE_URL.'
+        )
     )
     parser.add_argument(
         '--facets', '-f',
@@ -472,6 +605,7 @@ Paper: https://arxiv.org/abs/2601.07110
     logger.info(f"  Output: {args.output}")
     logger.info(f"  Questionnaire: {augmenter.questionnaire_path}")
     logger.info(f"  Model: {args.model}")
+    logger.info(f"  Backend: {augmenter.backend} ({augmenter.base_url})")
     logger.info(f"  Facets: {facets or 'all'}")
     logger.info(f"  Temperature: {args.temperature}")
     logger.info(f"  Batch size: {args.batch_size}")
